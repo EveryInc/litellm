@@ -69,6 +69,13 @@ class LiteLLMCompletionTransformationHandler:
         )
 
         if isinstance(litellm_completion_response, ModelResponse):
+            # Try to preserve anthropic original response data if it exists
+            # This needs to happen right after completion() before any other processing
+            if hasattr(litellm_completion_response, '_hidden_params'):
+                anthropic_original = litellm_completion_response._hidden_params.get('anthropic_original_response')
+                if anthropic_original:
+                    # Store it to pass through to ResponsesAPI
+                    litellm_completion_response._preserved_anthropic_original = anthropic_original
             responses_api_response: ResponsesAPIResponse = (
                 LiteLLMCompletionResponsesConfig.transform_chat_completion_response_to_responses_api_response(
                     chat_completion_response=litellm_completion_response,

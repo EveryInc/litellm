@@ -953,6 +953,10 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         model_response.created = int(time.time())
         model_response.model = completion_response["model"]
 
+        # Preserve anthropic_original_response if it was set earlier
+        if hasattr(model_response, '_hidden_params') and 'anthropic_original_response' in model_response._hidden_params:
+            _hidden_params['anthropic_original_response'] = model_response._hidden_params['anthropic_original_response']
+        
         model_response._hidden_params = _hidden_params
 
         return model_response
@@ -1005,6 +1009,11 @@ class AnthropicConfig(AnthropicModelInfo, BaseConfig):
         ## RESPONSE OBJECT
         try:
             completion_response = raw_response.json()
+            # Store the parsed response in model_response _hidden_params for signature extraction
+            # This needs to be done early before _hidden_params gets overwritten
+            if not hasattr(model_response, '_hidden_params'):
+                model_response._hidden_params = {}
+            model_response._hidden_params['anthropic_original_response'] = completion_response
         except Exception as e:
             response_headers = getattr(raw_response, "headers", None)
             raise AnthropicError(

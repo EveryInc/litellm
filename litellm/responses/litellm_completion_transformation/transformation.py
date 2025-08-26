@@ -2,6 +2,7 @@
 Handles transforming from Responses API -> LiteLLM completion  (Chat Completion API)
 """
 
+import json
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union, cast
 
 from openai.types.responses.tool_param import FunctionToolParam
@@ -244,23 +245,250 @@ class LiteLLMCompletionResponsesConfig:
         if isinstance(input, str):
             messages.append(ChatCompletionUserMessage(role="user", content=input))
         elif isinstance(input, list):
-            for _input in input:
-                chat_completion_messages = LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
-                    input_item=_input
-                )
+            # Group items by response ID to handle responses API output items properly
+            grouped_items = LiteLLMCompletionResponsesConfig._group_responses_api_items_by_response_id(input)
+            
+            
+            for group in grouped_items:
+                if len(group) == 1:
+                    # Single item, process normally
+                    _input = group[0]
+                    chat_completion_messages = LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
+                        input_item=_input
+                    )
 
-                #########################################################
-                # If Input Item is a Tool Call Output, add it to the tool_call_output_messages list
-                #########################################################
-                if LiteLLMCompletionResponsesConfig._is_input_item_tool_call_output(
-                    input_item=_input
-                ):
-                    tool_call_output_messages.extend(chat_completion_messages)
+                    #########################################################
+                    # If Input Item is a Tool Call Output, add it to the tool_call_output_messages list
+                    #########################################################
+                    if LiteLLMCompletionResponsesConfig._is_input_item_tool_call_output(
+                        input_item=_input
+                    ):
+                        tool_call_output_messages.extend(chat_completion_messages)
+                    else:
+                        messages.extend(chat_completion_messages)
                 else:
-                    messages.extend(chat_completion_messages)
+                    # Multiple items from same response, combine them properly
+                    combined_messages = LiteLLMCompletionResponsesConfig._transform_grouped_responses_api_items_to_chat_completion_message(
+                        grouped_items=group
+                    )
+                    messages.extend(combined_messages)
 
         messages.extend(tool_call_output_messages)
         return messages
+
+    @staticmethod
+    def _group_responses_api_items_by_response_id(input_items: List[Any]) -> List[List[Any]]:
+        """
+        Group responses API items by their response ID to handle multi-part responses properly.
+        Items from the same response (reasoning, message, function_call) should be grouped together.
+        """
+        groups = []
+        current_response_group = []
+        
+        for item in input_items:
+            item_type = None
+            item_role = None
+            
+            # Identify item type and role
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                item_role = item.get("role")
+            elif hasattr(item, 'type'):
+                item_type = getattr(item, 'type', None)
+                item_role = getattr(item, 'role', None)
+            
+            # Start a new group if we hit a user message or if this is the first item
+            if item_role == "user" or (len(current_response_group) == 0 and item_role != "assistant"):
+                if current_response_group:
+                    groups.append(current_response_group)
+                current_response_group = [item]
+            # Group assistant-related items together (reasoning, message, function_call)
+            elif (item_type in ["reasoning", "message", "function_call"] or 
+                  item_role == "assistant" or 
+                  (hasattr(item, '__class__') and 'Function' in item.__class__.__name__)):
+                current_response_group.append(item)
+            # Function call output should also be grouped with the function call
+            elif item_type == "function_call_output":
+                # If current group has function calls, add to it; otherwise start new group
+                if current_response_group:
+                    current_response_group.append(item)
+                else:
+                    current_response_group = [item]
+            else:
+                # Other items get their own group
+                if current_response_group:
+                    groups.append(current_response_group)
+                    current_response_group = []
+                groups.append([item])
+        
+        # Don't forget the last group
+        if current_response_group:
+            groups.append(current_response_group)
+        
+        return groups
+
+    @staticmethod
+    def _transform_grouped_responses_api_items_to_chat_completion_message(
+        grouped_items: List[Any]
+    ) -> List[Union[AllMessageValues, GenericChatCompletionMessage, ChatCompletionResponseMessage]]:
+        """
+        Transform a group of related responses API items (reasoning, message, function_call) 
+        into a single coherent chat completion message with proper thinking content.
+        """
+        # Separate the different types of items
+        reasoning_items = []
+        message_items = []
+        function_call_items = []
+        other_items = []
+        
+        for item in grouped_items:
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                if item_type == "reasoning":
+                    reasoning_items.append(item)
+                elif item_type == "message":
+                    message_items.append(item)
+                elif item_type == "function_call":
+                    function_call_items.append(item)
+                else:
+                    other_items.append(item)
+            else:
+                other_items.append(item)
+        
+        # Separate different types of items
+        user_messages = []
+        assistant_items = []
+        function_call_items = []
+        function_call_output_items = []
+        
+        for item in grouped_items:
+            item_type = None
+            item_role = None
+            
+            if isinstance(item, dict):
+                item_type = item.get("type")
+                item_role = item.get("role")
+            elif hasattr(item, 'type'):
+                item_type = getattr(item, 'type', None)
+                item_role = getattr(item, 'role', None)
+            
+            if item_type == "function_call_output":
+                function_call_output_items.append(item)
+            elif item_type == "function_call" or (hasattr(item, '__class__') and 'Function' in item.__class__.__name__):
+                function_call_items.append(item)
+            elif item_role == "user":
+                user_messages.append(item)
+            else:
+                assistant_items.append(item)
+        
+        result = []
+        
+        # Process user messages first
+        for user_item in user_messages:
+            messages = LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
+                input_item=user_item
+            )
+            result.extend(messages)
+        
+        # Build combined assistant message from reasoning, message, and function call items
+        if assistant_items:
+            role = "assistant"
+            content = []
+            
+            # Add thinking content from reasoning items first
+            for item in assistant_items:
+                if (isinstance(item, dict) and item.get("type") == "reasoning") or \
+                   (hasattr(item, 'type') and getattr(item, 'type') == "reasoning"):
+                    reasoning_content = item.get("content", []) if isinstance(item, dict) else getattr(item, 'content', [])
+                    for reasoning_content_item in reasoning_content:
+                        if hasattr(reasoning_content_item, 'text'):
+                            thinking_text = getattr(reasoning_content_item, 'text')
+                        else:
+                            thinking_text = reasoning_content_item.get("text", "")
+                        
+                        if thinking_text:
+                            # Try to find signature from attached data
+                            signature = None
+                            
+                            # Check if signature was attached to the reasoning item
+                            if hasattr(item, '_extracted_signature'):
+                                signature = getattr(item, '_extracted_signature')
+                            elif hasattr(item, '_hidden_params') and item._hidden_params.get('extracted_signature'):
+                                signature = item._hidden_params['extracted_signature']
+                            
+                            if signature:
+                                # Convert reasoning to thinking format for Anthropic with real signature
+                                thinking_block = {
+                                    "type": "thinking",
+                                    "thinking": thinking_text,
+                                    "signature": signature
+                                }
+                                content.append(thinking_block)
+            
+            # Add text content from message items
+            for item in assistant_items:
+                if (isinstance(item, dict) and item.get("type") == "message") or \
+                   (hasattr(item, 'type') and getattr(item, 'type') == "message"):
+                    message_content = item.get("content", []) if isinstance(item, dict) else getattr(item, 'content', [])
+                    for msg_content_item in message_content:
+                        if hasattr(msg_content_item, 'text'):
+                            text_content = getattr(msg_content_item, 'text')
+                        else:
+                            text_content = msg_content_item.get("text", "")
+                            
+                        if text_content:  # Only add non-empty text
+                            content.append({
+                                "type": "text",
+                                "text": text_content
+                            })
+            
+            # Add tool_use blocks for function call items (from both assistant_items and function_call_items)
+            all_function_calls = []
+            
+            # Check assistant_items for any function calls
+            for item in assistant_items:
+                if (isinstance(item, dict) and item.get("type") == "function_call") or \
+                   (hasattr(item, 'type') and getattr(item, 'type') == "function_call"):
+                    all_function_calls.append(item)
+            
+            # Add the separate function_call_items
+            all_function_calls.extend(function_call_items)
+            
+            # Process all function calls
+            for item in all_function_calls:
+                call_id = item.get("call_id") or item.get("id") if isinstance(item, dict) else \
+                          getattr(item, 'call_id', None) or getattr(item, 'id', None)
+                name = item.get("name") if isinstance(item, dict) else getattr(item, 'name', None)
+                arguments = item.get("arguments") if isinstance(item, dict) else getattr(item, 'arguments', None)
+                
+                if call_id and name and arguments:
+                    tool_use_block = {
+                        "type": "tool_use",
+                        "id": call_id,
+                        "name": name,
+                        "input": json.loads(arguments)
+                    }
+                    content.append(tool_use_block)
+            
+            # Create the combined assistant message
+            from litellm.types.llms.openai import ChatCompletionAssistantMessage
+            result.append(
+                ChatCompletionAssistantMessage(
+                    role=role,
+                    content=LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
+                        content if content else None
+                    )
+                )
+            )
+        
+        # Process function_call_output items as tool messages
+        for function_output in function_call_output_items:
+            messages = LiteLLMCompletionResponsesConfig._transform_responses_api_input_item_to_chat_completion_message(
+                input_item=function_output
+            )
+            result.extend(messages)
+        
+        return result
 
     @staticmethod
     def _ensure_tool_call_output_has_corresponding_tool_call(
@@ -310,11 +538,83 @@ class LiteLLMCompletionResponsesConfig:
                 function_call=input_item
             )
         else:
+            role = input_item.get("role") or "user"
+            content = input_item.get("content")
+            
+            # Special handling for assistant messages with tool_use content blocks
+            if role == "assistant" and isinstance(content, list):
+                tool_calls = []
+                filtered_content = []
+                
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        # Convert tool_use content to tool_calls
+                        tool_calls.append({
+                            "id": item.get("id"),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name"),
+                                "arguments": json.dumps(item.get("input", {}))
+                            }
+                        })
+                    else:
+                        # Keep other content types
+                        filtered_content.append(item)
+                
+                # If we found tool_use blocks, create message with tool_calls
+                if tool_calls:
+                    from litellm.types.llms.openai import ChatCompletionAssistantMessage
+                    return [
+                        ChatCompletionAssistantMessage(
+                            role=role,
+                            content=LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
+                                filtered_content if filtered_content else None
+                            ),
+                            tool_calls=tool_calls
+                        )
+                    ]
+            
+            # Special handling for user messages with tool_result content blocks
+            elif role == "user" and isinstance(content, list):
+                from litellm.types.llms.openai import ChatCompletionToolMessage
+                messages = []
+                remaining_content = []
+                
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "tool_result":
+                        # Convert tool_result to a tool message
+                        messages.append(
+                            ChatCompletionToolMessage(
+                                role="tool",
+                                content=item.get("content", ""),
+                                tool_call_id=item.get("tool_use_id", "")
+                            )
+                        )
+                    else:
+                        # Keep other content types for the user message
+                        remaining_content.append(item)
+                
+                # Add user message for any remaining content
+                if remaining_content:
+                    messages.append(
+                        GenericChatCompletionMessage(
+                            role=role,
+                            content=LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
+                                remaining_content
+                            ),
+                        )
+                    )
+                
+                # Return tool messages if found, otherwise fall through to default
+                if messages:
+                    return messages
+            
+            # Default handling for other message types
             return [
                 GenericChatCompletionMessage(
-                    role=input_item.get("role") or "user",
+                    role=role,
                     content=LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
-                        input_item.get("content")
+                        content
                     ),
                 )
             ]
@@ -683,6 +983,21 @@ class LiteLLMCompletionResponsesConfig:
             ),
             user=getattr(chat_completion_response, "user", None),
         )
+        
+        # Store raw response data in hidden params if available from the ModelResponse
+        if hasattr(chat_completion_response, '_preserved_anthropic_original'):
+            # Use the preserved anthropic original response for signature extraction
+            responses_api_response._hidden_params['anthropic_original_response'] = chat_completion_response._preserved_anthropic_original
+        
+        if hasattr(chat_completion_response, '_hidden_params'):
+            # Also pass through any anthropic original response from hidden params (fallback)
+            anthropic_original = chat_completion_response._hidden_params.get('anthropic_original_response')
+            if anthropic_original and 'anthropic_original_response' not in responses_api_response._hidden_params:
+                responses_api_response._hidden_params['anthropic_original_response'] = anthropic_original
+            
+            # Also keep any other hidden params
+            responses_api_response._hidden_params['raw_response_data'] = chat_completion_response._hidden_params.get('original_response')
+        
         return responses_api_response
 
     @staticmethod
