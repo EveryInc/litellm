@@ -715,6 +715,7 @@ ValidUserMessageContentTypes = [
     "document",
     "video_url",
     "file",
+    "tool_result",  # Allow Anthropic tool_result in user messages for responses API
 ]  # used for validating user messages. Prevent users from accidentally sending anthropic messages.
 
 AllMessageValues = Union[

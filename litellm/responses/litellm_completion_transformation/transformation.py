@@ -513,14 +513,32 @@ class LiteLLMCompletionResponsesConfig:
                             )
                         )
                     else:
-                        content_list.append(
-                            {
-                                "type": LiteLLMCompletionResponsesConfig._get_chat_completion_request_content_type(
-                                    item.get("type") or "text"
-                                ),
-                                "text": item.get("text"),
-                            }
+                        # Handle different content types with their specific field names
+                        item_type = item.get("type")
+                        transformed_type = LiteLLMCompletionResponsesConfig._get_chat_completion_request_content_type(
+                            item_type or "text"
                         )
+                        
+                        result_item = {"type": transformed_type}
+                        
+                        # Use the correct field name based on the content type
+                        if item_type == "thinking":
+                            result_item["thinking"] = item.get("thinking")
+                            # Preserve signature if present
+                            if item.get("signature"):
+                                result_item["signature"] = item.get("signature")
+                        elif item_type == "tool_use":
+                            result_item["id"] = item.get("id")
+                            result_item["name"] = item.get("name") 
+                            result_item["input"] = item.get("input")
+                        elif item_type == "tool_result":
+                            result_item["tool_use_id"] = item.get("tool_use_id")
+                            result_item["content"] = item.get("content")
+                        else:
+                            # Default to text field for other types
+                            result_item["text"] = item.get("text")
+                        
+                        content_list.append(result_item)
             return content_list
         else:
             raise ValueError(f"Invalid content type: {type(content)}")
